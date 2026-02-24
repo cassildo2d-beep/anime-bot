@@ -6,21 +6,19 @@ import time
 from telegram import InputFile
 from config import CHUNK_SIZE
 
-# ==============================
-# CONFIG VISUAL
-# ==============================
-
 BAR_SIZE = 20
 
 
-# barra visual
-def progress_bar(percent: int):
+# =====================
+# UTILIDADES
+# =====================
+
+def progress_bar(percent):
     filled = int(BAR_SIZE * percent / 100)
     return "█" * filled + "░" * (BAR_SIZE - filled)
 
 
-# formatar tamanho
-def format_size(size: float):
+def format_size(size):
     for unit in ["B", "KB", "MB", "GB"]:
         if size < 1024:
             return f"{size:.2f} {unit}"
@@ -28,46 +26,52 @@ def format_size(size: float):
     return f"{size:.2f} TB"
 
 
-# pegar nome original do arquivo
 def extract_filename(headers, url):
-    content_disp = headers.get("Content-Disposition")
-
-    if content_disp:
-        match = re.search(r'filename="?([^"]+)"?', content_disp)
+    cd = headers.get("Content-Disposition")
+    if cd:
+        match = re.search(r'filename="?([^"]+)"?', cd)
         if match:
             return match.group(1)
 
-    # fallback pelo link
     name = url.split("/")[-1].split("?")[0]
     if "." not in name:
         name += ".mp4"
-
     return name
 
 
-# ==============================
+# =====================
 # STREAM PRINCIPAL
-# ==============================
+# =====================
 
 async def stream_to_telegram(app, chat_id, url, filename=None):
 
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Range": "bytes=0-"  # 🔥 FORÇA STREAMING REAL
+    }
+
     async with httpx.AsyncClient(
         timeout=None,
-        follow_redirects=True
+        follow_redirects=True,
+        headers=headers
     ) as client:
 
-        async with client.stream("GET", url) as response:
+        # resolve redirects primeiro
+        r = await client.get(url)
+        final_url = str(r.url)
 
-            # ------------------------------
-            # METADADOS DO ARQUIVO
-            # ------------------------------
+        async with client.stream("GET", final_url) as response:
+
+            content_type = response.headers.get("Content-Type", "")
+            if "video" not in content_type and "octet-stream" not in content_type:
+                await app.bot.send_message(
+                    chat_id,
+                    "❌ O link não retornou um vídeo direto."
+                )
+                return
 
             real_filename = filename or extract_filename(
-                response.headers, url
-            )
-
-            mime = response.headers.get(
-                "Content-Type", "video/mp4"
+                response.headers, final_url
             )
 
             total = int(response.headers.get("Content-Length", 0))
@@ -78,37 +82,35 @@ async def stream_to_telegram(app, chat_id, url, filename=None):
             start_time = time.time()
             last_update = 0
 
-            # mensagem inicial
             progress_msg = await app.bot.send_message(
                 chat_id,
                 f"🎬 **{real_filename}**\n\nIniciando streaming...",
                 parse_mode="Markdown"
             )
 
-            # ------------------------------
+            # =====================
             # DOWNLOAD STREAMING
-            # ------------------------------
+            # =====================
 
             with open(temp_path, "wb") as f:
 
                 async for chunk in response.aiter_bytes(CHUNK_SIZE):
+
+                    if not chunk:
+                        continue
 
                     f.write(chunk)
                     downloaded += len(chunk)
 
                     now = time.time()
 
-                    # atualiza a cada 2 segundos
                     if total and now - last_update > 2:
 
                         percent = int(downloaded * 100 / total)
 
                         elapsed = now - start_time
                         speed = downloaded / elapsed if elapsed else 0
-                        eta = (
-                            (total - downloaded) / speed
-                            if speed else 0
-                        )
+                        eta = (total - downloaded) / speed if speed else 0
 
                         text = (
                             f"🎬 **{real_filename}**\n\n"
@@ -128,9 +130,9 @@ async def stream_to_telegram(app, chat_id, url, filename=None):
 
                         last_update = now
 
-            # ------------------------------
-            # ENVIO PARA TELEGRAM
-            # ------------------------------
+            # =====================
+            # ENVIO TELEGRAM
+            # =====================
 
             await progress_msg.edit_text(
                 "📤 Enviando episódio para o Telegram..."
@@ -144,13 +146,14 @@ async def stream_to_telegram(app, chat_id, url, filename=None):
                     supports_streaming=True
                 )
 
-            await progress_msg.edit_text("✅ Episódio enviado com sucesso!")
+            await progress_msg.edit_text("✅ Episódio enviado!")
 
-    # ------------------------------
-    # LIMPEZA AUTOMÁTICA
-    # ------------------------------
+    # =====================
+    # LIMPEZA
+    # =====================
 
     try:
         os.remove(temp_path)
     except:
         pass
+        
