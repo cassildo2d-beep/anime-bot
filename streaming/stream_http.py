@@ -1,10 +1,9 @@
-# streaming/stream_http.py
 import aiohttp
-import asyncio
+import io
 import re
+from telegram import InputFile
 
 CHUNK_SIZE = 1024 * 256  # 256KB
-
 BAR_SIZE = 20
 
 def progress_bar(percent: float, length: int = 20) -> str:
@@ -33,8 +32,7 @@ def extract_filename(headers, url: str) -> str:
 
 async def stream_to_telegram(app, chat_id, url: str, progress_callback=None):
     """
-    Função que substitui stream_video.
-    Faz streaming real para o bot.
+    Faz streaming direto para o Telegram usando BytesIO
     """
     timeout = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -48,7 +46,6 @@ async def stream_to_telegram(app, chat_id, url: str, progress_callback=None):
             last_update = 0
             data = bytearray()
 
-            # mensagem inicial no Telegram
             if progress_callback:
                 await progress_callback(f"🎬 {filename}", 0, total_size, 0, progress_bar(0))
 
@@ -57,21 +54,16 @@ async def stream_to_telegram(app, chat_id, url: str, progress_callback=None):
                     continue
                 data.extend(chunk)
                 downloaded += len(chunk)
-                if total_size:
-                    percent = (downloaded / total_size) * 100
-                else:
-                    percent = 0
+                percent = (downloaded / total_size) * 100 if total_size else 0
                 if progress_callback and percent - last_update >= 1:
                     last_update = percent
                     bar = progress_bar(percent)
                     await progress_callback(filename, downloaded, total_size, percent, bar)
 
-            # envia vídeo para o Telegram
-            from telegram import InputFile
-            import io
             bio = io.BytesIO(data)
             bio.name = filename
             bio.seek(0)
+
             await app.bot.send_video(
                 chat_id=chat_id,
                 video=InputFile(bio, filename=filename),
