@@ -1,84 +1,155 @@
 import httpx
-import asyncio
 import os
+import re
 import time
+
 from telegram import InputFile
 from config import CHUNK_SIZE
+
+# ==============================
+# CONFIG VISUAL
+# ==============================
 
 BAR_SIZE = 20
 
 
-def bar(p):
-    filled = int(BAR_SIZE * p / 100)
+# barra visual
+def progress_bar(percent: int):
+    filled = int(BAR_SIZE * percent / 100)
     return "█" * filled + "░" * (BAR_SIZE - filled)
 
 
-def size_fmt(size):
+# formatar tamanho
+def format_size(size: float):
     for unit in ["B", "KB", "MB", "GB"]:
         if size < 1024:
-            return f"{size:.2f}{unit}"
+            return f"{size:.2f} {unit}"
         size /= 1024
+    return f"{size:.2f} TB"
 
 
-async def stream_to_telegram(app, chat_id, url, filename):
+# pegar nome original do arquivo
+def extract_filename(headers, url):
+    content_disp = headers.get("Content-Disposition")
 
-    temp_path = f"/tmp/{filename}"
+    if content_disp:
+        match = re.search(r'filename="?([^"]+)"?', content_disp)
+        if match:
+            return match.group(1)
 
-    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+    # fallback pelo link
+    name = url.split("/")[-1].split("?")[0]
+    if "." not in name:
+        name += ".mp4"
+
+    return name
+
+
+# ==============================
+# STREAM PRINCIPAL
+# ==============================
+
+async def stream_to_telegram(app, chat_id, url, filename=None):
+
+    async with httpx.AsyncClient(
+        timeout=None,
+        follow_redirects=True
+    ) as client:
+
         async with client.stream("GET", url) as response:
 
-            total = int(response.headers.get("Content-Length", 0))
-            downloaded = 0
+            # ------------------------------
+            # METADADOS DO ARQUIVO
+            # ------------------------------
 
-            start = time.time()
-            last_update = 0
-
-            msg = await app.bot.send_message(
-                chat_id,
-                f"🎬 {filename}\n\nIniciando streaming..."
+            real_filename = filename or extract_filename(
+                response.headers, url
             )
 
-            # abre arquivo temporário STREAMÁVEL
+            mime = response.headers.get(
+                "Content-Type", "video/mp4"
+            )
+
+            total = int(response.headers.get("Content-Length", 0))
+
+            temp_path = f"/tmp/{real_filename}"
+
+            downloaded = 0
+            start_time = time.time()
+            last_update = 0
+
+            # mensagem inicial
+            progress_msg = await app.bot.send_message(
+                chat_id,
+                f"🎬 **{real_filename}**\n\nIniciando streaming...",
+                parse_mode="Markdown"
+            )
+
+            # ------------------------------
+            # DOWNLOAD STREAMING
+            # ------------------------------
+
             with open(temp_path, "wb") as f:
 
                 async for chunk in response.aiter_bytes(CHUNK_SIZE):
+
                     f.write(chunk)
                     downloaded += len(chunk)
 
                     now = time.time()
 
-                    # update a cada 2s
-                    if now - last_update > 2 and total:
+                    # atualiza a cada 2 segundos
+                    if total and now - last_update > 2:
+
                         percent = int(downloaded * 100 / total)
 
-                        elapsed = now - start
+                        elapsed = now - start_time
                         speed = downloaded / elapsed if elapsed else 0
-                        eta = (total - downloaded) / speed if speed else 0
+                        eta = (
+                            (total - downloaded) / speed
+                            if speed else 0
+                        )
 
                         text = (
-                            f"🎬 {filename}\n\n"
-                            f"{bar(percent)} {percent}%\n"
-                            f"📦 {size_fmt(downloaded)} / {size_fmt(total)}\n"
-                            f"⚡ {size_fmt(speed)}/s\n"
+                            f"🎬 **{real_filename}**\n\n"
+                            f"{progress_bar(percent)} {percent}%\n\n"
+                            f"📦 {format_size(downloaded)} / {format_size(total)}\n"
+                            f"⚡ {format_size(speed)}/s\n"
                             f"⏳ ETA: {int(eta)}s"
                         )
 
                         try:
-                            await msg.edit_text(text)
+                            await progress_msg.edit_text(
+                                text,
+                                parse_mode="Markdown"
+                            )
                         except:
                             pass
 
                         last_update = now
 
-            # DOWNLOAD terminou → upload começa instantaneamente
-            await app.bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(temp_path, filename=filename)
+            # ------------------------------
+            # ENVIO PARA TELEGRAM
+            # ------------------------------
+
+            await progress_msg.edit_text(
+                "📤 Enviando episódio para o Telegram..."
             )
 
-            await msg.edit_text("✅ Episódio enviado!")
+            with open(temp_path, "rb") as video_file:
 
-    # limpa storage
+                await app.bot.send_video(
+                    chat_id=chat_id,
+                    video=InputFile(video_file, filename=real_filename),
+                    supports_streaming=True
+                )
+
+            await progress_msg.edit_text("✅ Episódio enviado com sucesso!")
+
+    # ------------------------------
+    # LIMPEZA AUTOMÁTICA
+    # ------------------------------
+
     try:
         os.remove(temp_path)
     except:
