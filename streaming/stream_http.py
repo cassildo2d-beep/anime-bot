@@ -1,159 +1,131 @@
-import httpx
-import os
+import aiohttp
+import asyncio
+import math
 import re
-import time
 
-from telegram import InputFile
-from config import CHUNK_SIZE
-
-BAR_SIZE = 20
+CHUNK_SIZE = 1024 * 256  # 256KB
 
 
-# =====================
-# UTILIDADES
-# =====================
+# =========================
+# Utilidades
+# =========================
 
-def progress_bar(percent):
-    filled = int(BAR_SIZE * percent / 100)
-    return "█" * filled + "░" * (BAR_SIZE - filled)
+def format_size(size: int) -> str:
+    """Converte bytes para MB/GB"""
+    if not size:
+        return "Desconhecido"
+
+    mb = size / (1024 * 1024)
+    if mb < 1024:
+        return f"{mb:.2f} MB"
+
+    gb = mb / 1024
+    return f"{gb:.2f} GB"
 
 
-def format_size(size):
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} TB"
+def progress_bar(percent: float, length: int = 20) -> str:
+    filled = int(length * percent / 100)
+    return "█" * filled + "░" * (length - filled)
 
 
-def extract_filename(headers, url):
+def extract_filename(headers, url: str) -> str:
+    """Tenta pegar nome original do vídeo"""
     cd = headers.get("Content-Disposition")
+
     if cd:
-        match = re.search(r'filename="?([^"]+)"?', cd)
+        match = re.search('filename="?(.+?)"?$', cd)
         if match:
             return match.group(1)
 
+    # fallback pelo link
     name = url.split("/")[-1].split("?")[0]
+
     if "." not in name:
         name += ".mp4"
+
     return name
 
 
-# =====================
+# =========================
+# Detectar vídeo real
+# =========================
+
+async def resolve_video_url(session, url: str):
+    """
+    Segue redirects e tenta descobrir se é vídeo real
+    """
+    async with session.get(url, allow_redirects=True) as resp:
+        content_type = resp.headers.get("Content-Type", "").lower()
+
+        # aceita vários tipos usados por CDNs
+        if any(x in content_type for x in [
+            "video",
+            "octet-stream",
+            "application/mp4",
+            "binary"
+        ]):
+            return str(resp.url), resp.headers
+
+        return None, None
+
+
+# =========================
 # STREAM PRINCIPAL
-# =====================
+# =========================
 
-async def stream_to_telegram(app, chat_id, url, filename=None):
+async def stream_video(
+    url: str,
+    progress_callback=None
+):
+    """
+    Faz download em streaming e retorna bytes do vídeo
+    """
 
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Range": "bytes=0-"  # 🔥 FORÇA STREAMING REAL
-    }
+    timeout = aiohttp.ClientTimeout(total=None)
 
-    async with httpx.AsyncClient(
-        timeout=None,
-        follow_redirects=True,
-        headers=headers
-    ) as client:
+    async with aiohttp.ClientSession(timeout=timeout) as session:
 
-        # resolve redirects primeiro
-        r = await client.get(url)
-        final_url = str(r.url)
+        # descobrir URL final do vídeo
+        final_url, headers = await resolve_video_url(session, url)
 
-        async with client.stream("GET", final_url) as response:
+        if not final_url:
+            raise Exception("❌ O link não retornou um vídeo direto.")
 
-            content_type = response.headers.get("Content-Type", "")
-            if "video" not in content_type and "octet-stream" not in content_type:
-                await app.bot.send_message(
-                    chat_id,
-                    "❌ O link não retornou um vídeo direto."
-                )
-                return
+        total_size = int(headers.get("Content-Length", 0))
+        filename = extract_filename(headers, final_url)
 
-            real_filename = filename or extract_filename(
-                response.headers, final_url
-            )
+        downloaded = 0
+        last_update = 0
 
-            total = int(response.headers.get("Content-Length", 0))
+        data = bytearray()
 
-            temp_path = f"/tmp/{real_filename}"
+        async with session.get(final_url) as resp:
 
-            downloaded = 0
-            start_time = time.time()
-            last_update = 0
+            async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                if not chunk:
+                    continue
 
-            progress_msg = await app.bot.send_message(
-                chat_id,
-                f"🎬 **{real_filename}**\n\nIniciando streaming...",
-                parse_mode="Markdown"
-            )
+                data.extend(chunk)
+                downloaded += len(chunk)
 
-            # =====================
-            # DOWNLOAD STREAMING
-            # =====================
+                # atualizar progresso a cada ~1%
+                if total_size:
+                    percent = (downloaded / total_size) * 100
+                else:
+                    percent = 0
 
-            with open(temp_path, "wb") as f:
+                if progress_callback:
+                    if percent - last_update >= 1:
+                        last_update = percent
 
-                async for chunk in response.aiter_bytes(CHUNK_SIZE):
+                        bar = progress_bar(percent)
 
-                    if not chunk:
-                        continue
-
-                    f.write(chunk)
-                    downloaded += len(chunk)
-
-                    now = time.time()
-
-                    if total and now - last_update > 2:
-
-                        percent = int(downloaded * 100 / total)
-
-                        elapsed = now - start_time
-                        speed = downloaded / elapsed if elapsed else 0
-                        eta = (total - downloaded) / speed if speed else 0
-
-                        text = (
-                            f"🎬 **{real_filename}**\n\n"
-                            f"{progress_bar(percent)} {percent}%\n\n"
-                            f"📦 {format_size(downloaded)} / {format_size(total)}\n"
-                            f"⚡ {format_size(speed)}/s\n"
-                            f"⏳ ETA: {int(eta)}s"
+                        await progress_callback(
+                            filename,
+                            downloaded,
+                            total_size,
+                            percent,
+                            bar
                         )
 
-                        try:
-                            await progress_msg.edit_text(
-                                text,
-                                parse_mode="Markdown"
-                            )
-                        except:
-                            pass
-
-                        last_update = now
-
-            # =====================
-            # ENVIO TELEGRAM
-            # =====================
-
-            await progress_msg.edit_text(
-                "📤 Enviando episódio para o Telegram..."
-            )
-
-            with open(temp_path, "rb") as video_file:
-
-                await app.bot.send_video(
-                    chat_id=chat_id,
-                    video=InputFile(video_file, filename=real_filename),
-                    supports_streaming=True
-                )
-
-            await progress_msg.edit_text("✅ Episódio enviado!")
-
-    # =====================
-    # LIMPEZA
-    # =====================
-
-    try:
-        os.remove(temp_path)
-    except:
-        pass
-        
+        return bytes(data), filename, total_size
